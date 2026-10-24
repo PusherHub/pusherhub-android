@@ -57,11 +57,14 @@ import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TimeZone;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -113,6 +116,19 @@ public final class PusherHub {
     // exactly when a new device row is the right answer.
     private static final String LAST_REGISTERED_TOKEN_KEY = "pushhub_last_registered_token";
 
+    // The last tapped notification handled. An Activity re-created with its
+    // original Intent (rotation, or the app restored after Android stopped
+    // it) brings the same tap back to handleIntent() — it's handled once.
+    private static final String LAST_OPENED_MESSAGE_KEY = "pushhub_last_opened_message";
+
+    // What PusherHub itself puts in a push's data next to the Custom Data —
+    // left out of what onNotificationOpened gets.
+    static final Set<String> OWN_DATA_KEYS = new HashSet<>(Arrays.asList("notification_id", "click_action", "deep_link"));
+
+    // Firebase's own keys on the tap Intent of a notification Android showed
+    // itself, next to the push's data.
+    private static final Set<String> FIREBASE_INTENT_KEYS = new HashSet<>(Arrays.asList("from", "collapse_key", "message_type"));
+
     /**
      * The action PusherHub's backend hardcodes into every FCM payload's
      * android.notification.click_action (a holdover from the Flutter SDK,
@@ -135,7 +151,13 @@ public final class PusherHub {
     private static String publicKey;
     private static String baseUrl;
     private static OnNotificationClickListener onNotificationClick;
+    private static OnNotificationOpenedListener onNotificationOpened;
     private static boolean initialized = false;
+
+    // Opens reported before this launch had its FCM token — a tap that
+    // launched the app is handled in onCreate(), before the token arrives —
+    // sent once the device is registered instead of being dropped.
+    private static final List<String[]> pendingEvents = new ArrayList<>();
 
     // Only set when initialize() was called with an Activity (e.g. from
     // MainActivity.onCreate(), not an Application subclass) — used solely to
@@ -203,6 +225,18 @@ public final class PusherHub {
         void onNotificationClick(String deepLink);
     }
 
+    /**
+     * Called from {@link #handleIntent} on every tap of a PusherHub
+     * notification — whether the app was open, in the background or closed —
+     * with the Custom Data it was sent with (empty if it had none). Open the
+     * right screen from it, e.g. {@code data.get("campaign_id")}. Values
+     * arrive as text — {@code {"campaign_id": 232}} gives "232" — and a nested
+     * object or list as its JSON.
+     */
+    public interface OnNotificationOpenedListener {
+        void onNotificationOpened(Map<String, String> data);
+    }
+
     /** Receives the result of {@link #fetchInAppMessages}. */
     public interface InAppMessagesCallback {
         void onResult(List<InAppMessage> messages);
@@ -243,11 +277,28 @@ public final class PusherHub {
             String publicKey,
             String baseUrl,
             OnNotificationClickListener onNotificationClick) {
+        initialize(context, appKey, publicKey, baseUrl, onNotificationClick, null);
+    }
+
+    /**
+     * Same as {@link #initialize(Context, String, String, String, OnNotificationClickListener)}
+     * (pass null for no click listener), plus an optional listener given
+     * every tapped notification's Custom Data — see
+     * {@link OnNotificationOpenedListener}.
+     */
+    public static void initialize(
+            Context context,
+            String appKey,
+            String publicKey,
+            String baseUrl,
+            OnNotificationClickListener onNotificationClick,
+            OnNotificationOpenedListener onNotificationOpened) {
         PusherHub.appContext = context.getApplicationContext();
         PusherHub.appKey = appKey;
         PusherHub.publicKey = publicKey;
         PusherHub.baseUrl = baseUrl;
         PusherHub.onNotificationClick = onNotificationClick;
+        PusherHub.onNotificationOpened = onNotificationOpened;
         PusherHub.initialized = true;
         if (context instanceof Activity) {
             activityRef = new WeakReference<>((Activity) context);
@@ -1077,15 +1128,17 @@ public final class PusherHub {
      * onNewIntent(intent) — handles the case where the app was backgrounded
      * or fully killed and the user tapped a PusherHub notification to
      * (re)launch it. Reports the open (and click-through, if the
-     * notification carried a deep link) and opens the deep link.
+     * notification carried a deep link), hands its Custom Data to the
+     * onNotificationOpened listener, and opens the deep link.
      *
-     * (The "already in foreground" tap case is handled automatically by
-     * {@link PusherHubMessagingService}'s own PendingIntent — you don't need
-     * to call this for that path, but it's harmless to call
-     * unconditionally.)
+     * (A tap on a notification that arrived while the app was open comes
+     * through here too: {@link PusherHubMessagingService}'s own PendingIntent
+     * relaunches this same Activity with it. It's safe to call
+     * unconditionally — each tap is handled once.)
      */
     public static void handleIntent(Intent intent) {
         if (intent == null) return;
+        if (!requireInitialized()) return;
         // The prefixed extra is only present when PusherHub itself built the tap
         // PendingIntent (app was in the foreground when the push arrived). For a
         // backgrounded/killed app, Android auto-displays the notification from the
@@ -1096,11 +1149,44 @@ public final class PusherHub {
         if (notificationId == null) return;
         String deepLink = intent.getStringExtra(PusherHubMessagingService.EXTRA_DEEP_LINK);
         if (deepLink == null) deepLink = intent.getStringExtra("deep_link");
-        handleNotificationOpened(notificationId, deepLink);
+
+        String messageId = intent.getStringExtra(PusherHubMessagingService.EXTRA_MESSAGE_ID);
+        if (messageId == null) messageId = intent.getStringExtra("google.message_id");
+        if (messageId != null) {
+            if (messageId.equals(prefs().getString(LAST_OPENED_MESSAGE_KEY, null))) return;
+            prefs().edit().putString(LAST_OPENED_MESSAGE_KEY, messageId).apply();
+        }
+
+        handleNotificationOpened(notificationId, deepLink, customDataOf(intent));
     }
 
-    private static void handleNotificationOpened(String notificationId, String deepLink) {
+    /**
+     * A tapped notification's Custom Data: the bundle PusherHub's own
+     * notification puts on its tap, or — for one Android showed itself — the
+     * push's data keys on the Intent, without PusherHub's and Firebase's own.
+     */
+    private static Map<String, String> customDataOf(Intent intent) {
+        Map<String, String> data = new HashMap<>();
+        Bundle bundle = intent.getBundleExtra(PusherHubMessagingService.EXTRA_CUSTOM_DATA);
+        boolean fromIntent = bundle == null;
+        if (fromIntent) bundle = intent.getExtras();
+        if (bundle == null) return data;
+
+        for (String key : bundle.keySet()) {
+            if (fromIntent && (OWN_DATA_KEYS.contains(key) || FIREBASE_INTENT_KEYS.contains(key)
+                    || key.startsWith("google.") || key.startsWith("gcm."))) {
+                continue;
+            }
+            String value = bundle.getString(key);
+            if (value != null) data.put(key, value);
+        }
+        return data;
+    }
+
+    private static void handleNotificationOpened(String notificationId, String deepLink, Map<String, String> data) {
         trackEvent("track-open", notificationId);
+        OnNotificationOpenedListener opened = onNotificationOpened;
+        if (opened != null) opened.onNotificationOpened(data);
         if (deepLink != null && !deepLink.isEmpty()) {
             trackEvent("track-click", notificationId);
             openDeepLink(deepLink);
@@ -1126,7 +1212,9 @@ public final class PusherHub {
     private static void trackEvent(String endpoint, String notificationId) {
         String token = currentToken;
         if (token == null) {
-            Log.w(TAG, "Skipping " + endpoint + " — no FCM token registered yet.");
+            synchronized (pendingEvents) {
+                pendingEvents.add(new String[] {endpoint, notificationId});
+            }
             return;
         }
         executor.execute(() -> {
@@ -1146,6 +1234,17 @@ public final class PusherHub {
                 Log.w(TAG, "Failed to build " + endpoint + " request", e);
             }
         });
+    }
+
+    private static void flushPendingEvents() {
+        List<String[]> pending;
+        synchronized (pendingEvents) {
+            pending = new ArrayList<>(pendingEvents);
+            pendingEvents.clear();
+        }
+        for (String[] event : pending) {
+            trackEvent(event[0], event[1]);
+        }
     }
 
     private static void registerToken(String externalId, String token) {
@@ -1187,6 +1286,7 @@ public final class PusherHub {
                             .putString(LAST_REGISTERED_TOKEN_KEY, token)
                             .apply();
                     Log.i(TAG, "Device registered successfully.");
+                    flushPendingEvents();
                 } else {
                     Log.w(TAG, "Failed to register device.");
                 }
@@ -1454,6 +1554,8 @@ public final class PusherHub {
         static final String CHANNEL_ID = "pushhub_default";
         static final String EXTRA_NOTIFICATION_ID = "pushhub_notification_id";
         static final String EXTRA_DEEP_LINK = "pushhub_deep_link";
+        static final String EXTRA_MESSAGE_ID = "pushhub_message_id";
+        static final String EXTRA_CUSTOM_DATA = "pushhub_custom_data";
 
         @Override
         public void onNewToken(String token) {
@@ -1491,6 +1593,14 @@ public final class PusherHub {
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         if (notificationId != null) launchIntent.putExtra(EXTRA_NOTIFICATION_ID, notificationId);
         if (deepLink != null) launchIntent.putExtra(EXTRA_DEEP_LINK, deepLink);
+        if (message.getMessageId() != null) launchIntent.putExtra(EXTRA_MESSAGE_ID, message.getMessageId());
+        // The Custom Data, for onNotificationOpened — a notification Android
+        // shows itself carries the push's data keys on its tap already.
+        Bundle customData = new Bundle();
+        for (Map.Entry<String, String> entry : message.getData().entrySet()) {
+            if (!OWN_DATA_KEYS.contains(entry.getKey())) customData.putString(entry.getKey(), entry.getValue());
+        }
+        launchIntent.putExtra(EXTRA_CUSTOM_DATA, customData);
 
         PendingIntent pendingIntent = PendingIntent.getActivity(
                 context,

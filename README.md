@@ -9,6 +9,7 @@ Push notifications and in-app messages for your native Android app, sent through
 - Registers each phone with PusherHub, asks for the notification permission, and keeps its FCM token up to date
 - Links a phone to your own user id with `login()` — remembered across restarts until `logout()`
 - Reports notification opens and clicks, and follows a notification's deep link
+- Hands your app each tapped notification's Custom Data, so you can open the right screen
 - Shows in-app messages (banner, modal, full screen, center popup, bottom sheet) with plain Android views — works with Compose and classic Views
 - Optional device details, and state and city if you add the location permission
 
@@ -165,6 +166,37 @@ public class MainActivity extends AppCompatActivity {
 PusherHub.login(currentUserId)   // when someone signs in
 PusherHub.logout()               // when they sign out
 ```
+
+## Opening a screen when a notification is tapped
+
+Put your own data in **Custom Data** when you create a notification — say `{"campaign_id": "232"}` — and get it back on every tap, whether the app was open, in the background or closed. It runs from `PusherHub.handleIntent(intent)`, so keep that in `onCreate()` and `onNewIntent()`.
+
+```kotlin
+PusherHub.initialize(
+    context = this,
+    appKey = "YOUR_APP_KEY",
+    publicKey = "YOUR_PUBLIC_KEY",
+    baseUrl = "https://pusherhub.com/api",
+    onNotificationOpened = { data ->
+        data["campaign_id"]?.let { campaignId ->
+            startActivity(Intent(this, CampaignActivity::class.java).putExtra("campaign_id", campaignId))
+        }
+    },
+)
+```
+
+```java
+PusherHub.initialize(this, "YOUR_APP_KEY", "YOUR_PUBLIC_KEY", "https://pusherhub.com/api",
+        null, // your deep-link listener, if you have one
+        data -> {
+            String campaignId = data.get("campaign_id");
+            if (campaignId != null) {
+                startActivity(new Intent(this, CampaignActivity.class).putExtra("campaign_id", campaignId));
+            }
+        });
+```
+
+Every value arrives as text (`"232"`).
 
 ## Keys
 
